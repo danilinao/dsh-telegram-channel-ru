@@ -2068,3 +2068,157 @@ test('/history tools with no argument reports the current state', async () => {
   assert.equal(calls.length, 0, 'asking for the state must not fetch a page')
   await bridge.stop()
 })
+
+/**
+ * 0.13.1 regression: `page({throughSeq: -1})` is an EMPTY page on DSH 0.2 — the
+ * host computes `end = min(throughSeq + 1, …) = 0`. 0.12.x shipped exactly that
+ * request, so every `/history` answered "Сообщений в сессии пока нет".
+ * The page reader needs the session log cursor, and only the `follow()`
+ * snapshot frame carries it; older pages then use `page(throughSeq: cursor)`.
+ */
+function realishHistoryCtx() {
+  const calls: Array<{ kind: 'page' | 'follow'; request: Record<string, unknown> }> = []
+  const events: Array<{ type: string; seq: number; data: Record<string, unknown> }> = [
+    { type: 'user/message', seq: 0, data: { source: { kind: 'user' }, message: { content: [{ type: 'text', text: 'первый вопрос' }] } } },
+    { type: 'assistant/message', seq: 1, data: { message: { content: [{ type: 'reasoning', text: 'думаю' }, { type: 'text', text: 'первый ответ' }] } } },
+    { type: 'tool/call', seq: 2, data: { name: 'read_file', arguments: '{"path":"a.ts"}' } },
+    { type: 'assistant/message', seq: 3, data: { message: { content: [{ type: 'text', text: 'второй ответ' }] } } },
+    { type: 'user/message', seq: 4, data: { source: { kind: 'user' }, message: { content: [{ type: 'text', text: 'второй вопрос' }] } } },
+  ]
+  const bySeq = new Map(events.map((event) => [event.seq, event]))
+  const recordsFor = (seqs: number[]) => seqs.map((seq) => ({ event: bySeq.get(seq)! }))
+  const controller = {
+    // Mirrors the host: -1 is empty, a real cursor slices backwards.
+    page: async (request: Record<string, unknown>) => {
+      calls.push({ kind: 'page', request })
+      const throughSeq = request.throughSeq as number
+      if (throughSeq === -1) return { records: [], hasMore: false }
+      if (throughSeq === 4) {
+        const beforeSeq = request.beforeSeq as number | undefined
+        if (beforeSeq === 1) return { records: recordsFor([0]), hasMore: false }
+        return { records: recordsFor([1, 2, 3, 4]), hasMore: true }
+      }
+      return { records: [], hasMore: false }
+    },
+    follow: async function* (request: Record<string, unknown>) {
+      calls.push({ kind: 'follow', request })
+      yield { type: 'snapshot', cursor: 4, records: recordsFor([1, 2, 3, 4]), hasMore: true }
+      // Real followers keep streaming; the plugin must stop after the snapshot.
+      yield { type: 'event', event: bySeq.get(3) }
+      yield { type: 'event', event: bySeq.get(4) }
+    },
+  }
+  const ctx = {
+    logger: { info() {}, warn() {}, error() {} },
+    agents: { list: () => [], roots: () => [], get: () => undefined },
+    get(name: string) {
+      return name === 'sessionController' ? controller : undefined
+    },
+    on() { return () => {} },
+  }
+  return { ctx, calls }
+}
+
+test('/history reads the newest page from the follow() snapshot, never throughSeq: -1', async () => {
+  const sent: SentMessage[] = []
+  const { ctx, calls } = realishHistoryCtx()
+  const bridge = new TelegramBridge(ctx as any, {
+    token: 't',
+    allowedUserIds: [1],
+    allowAllUsers: false,
+    client: fakeClient(sent),
+    sleep: async () => {},
+  })
+  bindDirectly(bridge, 10, 'h1')
+
+  await bridge.processUpdate(messageUpdate(10, 1, '/history'))
+  const page = sent.map((m) => m.text).join('\n')
+  assert.match(page, /второй ответ/)
+  assert.match(page, /второй вопрос/)
+  assert.match(page, /🧠 Рассуждения/)
+  assert.match(page, /read_file/)
+  assert.deepEqual(calls.map((c) => c.kind), ['follow'], 'newest page must come from follow(), not page(-1)')
+  assert.ok(!calls.some((c) => c.request.throughSeq === -1), 'throughSeq: -1 returns an empty page')
+
+  // "⬅ Раньше" from the control message: the toggle row comes first, so reach
+  // the paging button by its callback prefix and page with the cached cursor.
+  const earlier = sent.at(-1)!.replyMarkup?.inline_keyboard?.flat()
+    .find((button) => button.callback_data?.startsWith('hist:'))
+  assert.ok(earlier, 'page must offer an "earlier" button')
+  const beforeSeq = Number(earlier!.callback_data!.slice('hist:'.length))
+  sent.length = 0
+  await bridge.processUpdate(callbackUpdate(10, 1, earlier!.callback_data!))
+  const older = sent.map((m) => m.text).join('\n')
+  assert.match(older, /первый вопрос/)
+  const pageCall = calls.find((c) => c.kind === 'page')
+  assert.ok(pageCall, 'older pages must use page() with the snapshot cursor')
+  assert.equal(pageCall!.request.throughSeq, 4)
+  assert.equal(pageCall!.request.beforeSeq, beforeSeq)
+  await bridge.stop()
+})
+
+/**
+ * The live host exposes `sessionQuery.observeSession()`, and that is the path
+ * `/history` must take: it reports the log cursor without activating the Agent,
+ * so paging never promotes a cold or archived session into a live one.
+ */
+test('/history takes the cursor from sessionQuery.observeSession, not follow()', async () => {
+  const sent: SentMessage[] = []
+  const calls: Array<{ kind: string; request?: Record<string, unknown>; options?: Record<string, unknown> }> = []
+  let disposed = 0
+  const events = [
+    { type: 'user/message', seq: 0, data: { source: { kind: 'user' }, message: { content: [{ type: 'text', text: 'привет' }] } } },
+    { type: 'assistant/message', seq: 1, data: { message: { content: [{ type: 'reasoning', text: 'думаю' }, { type: 'text', text: 'ответ' }] } } },
+  ]
+  const records = events.map((event) => ({ event }))
+  const controller = {
+    page: async (request: Record<string, unknown>) => {
+      calls.push({ kind: 'page', request })
+      if (request.throughSeq === -1) return { records: [], hasMore: false } // host behaviour
+      return { records, hasMore: false }
+    },
+    follow: async function* () {
+      calls.push({ kind: 'follow' })
+      yield { type: 'snapshot', cursor: 1, records, hasMore: false }
+    },
+  }
+  const query = {
+    observeSession: async (_id: string, options: Record<string, unknown>) => {
+      calls.push({ kind: 'observe', options })
+      return {
+        cursor: 1,
+        [Symbol.dispose]() { disposed += 1 },
+      }
+    },
+  }
+  const ctx = {
+    logger: { info() {}, warn() {}, error() {} },
+    agents: { list: () => [], roots: () => [], get: () => undefined },
+    get(name: string) {
+      if (name === 'sessionController') return controller
+      if (name === 'sessionQuery') return query
+      return undefined
+    },
+    on() { return () => {} },
+  }
+  const bridge = new TelegramBridge(ctx as any, {
+    token: 't',
+    allowedUserIds: [1],
+    allowAllUsers: false,
+    client: fakeClient(sent),
+    sleep: async () => {},
+  })
+  bindDirectly(bridge, 10, 'h1')
+
+  await bridge.processUpdate(messageUpdate(10, 1, '/history'))
+  const page = sent.map((m) => m.text).join('\n')
+  assert.match(page, /привет/)
+  assert.match(page, /ответ/)
+  assert.match(page, /🧠 Рассуждения/)
+  assert.ok(calls.some((c) => c.kind === 'observe'))
+  assert.ok(!calls.some((c) => c.kind === 'follow'), 'observeSession must be preferred over follow()')
+  const pageCall = calls.find((c) => c.kind === 'page')
+  assert.equal(pageCall!.request!.throughSeq, 1)
+  assert.equal(disposed, 1, 'the observation must be disposed')
+  await bridge.stop()
+})

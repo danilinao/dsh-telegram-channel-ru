@@ -375,6 +375,8 @@ export class TelegramBridge {
     beforeSeq?: number
     /** beforeSeq, с которым была показана текущая страница: нужен для перерисовки. */
     prevBeforeSeq?: number
+    /** Лог-курсор сессии из snapshot-кадра: `page()` без него отдаёт пустую страницу. */
+    cursor?: number
   }>()
   /** chatId → model awaiting reasoning-effort pick (kept outside picker so list refreshes won't drop it). */
   private readonly pendingModels = new Map<string, ModelOption>()
@@ -3440,92 +3442,186 @@ export class TelegramBridge {
 
   /**
    * One page of real session history: user/assistant messages, the model's
-   * reasoning (spoiler) and — when the chat wants them — tool calls as spoilers,
-   * via the host session controller, newest page by default.
+   * reasoning (spoiler) and — when the chat wants them — tool calls as spoilers.
+   *
+   * The whole trick is the cursor. `page({throughSeq: -1})` is NOT "latest" on
+   * DSH 0.2: the host computes `end = min(throughSeq + 1, …) = 0` and returns an
+   * empty page. That is the "Нет истории" bug — 0.12.x asked for `-1` and every
+   * session answered "Сообщений в сессии пока нет". A page needs the Session's
+   * log cursor, which comes from `sessionQuery.observeSession()` — the same
+   * non-activating read `page()` itself does. Only when that service is out of
+   * reach do we fall back to the `follow()` snapshot frame, because `follow()`
+   * promotes a cold session into a live Agent.
    */
   private async fetchHistoryPage(
     sessionId: string,
     beforeSeq?: number,
     maxMessages = 10,
     opts: { tools: boolean; reasoning: boolean } = { tools: true, reasoning: true },
-  ): Promise<{ blocks: string[]; earliestSeq?: number; hasMore: boolean } | undefined> {
+    cursor?: number,
+  ): Promise<{ blocks: string[]; earliestSeq?: number; hasMore: boolean; cursor?: number } | undefined> {
+    type Records = Array<{ event?: { type?: string; seq?: number; data?: Record<string, unknown> } }>
+    type Address = { kind: 'session'; sessionId: string }
     const controller = hostService<{
       page?: (
-        request: {
-          address: { kind: 'session'; sessionId: string }
-          throughSeq: number
-          maxMessages?: number
-          beforeSeq?: number
-        },
+        request: { address: Address; throughSeq: number; maxMessages?: number; beforeSeq?: number },
         signal?: AbortSignal,
-      ) => Promise<{
-        records?: Array<{ event?: { type?: string; seq?: number; data?: Record<string, unknown> } }>
-        hasMore?: boolean
-      }>
+      ) => Promise<{ records?: Records; hasMore?: boolean }>
+      follow?: (
+        request: { address: Address; maxMessages?: number },
+        signal?: AbortSignal,
+      ) => AsyncIterable<{ type?: string; cursor?: number; records?: Records; hasMore?: boolean }>
     }>(this.ctx, 'sessionController')
-    const page = controller?.page
-    if (typeof page !== 'function') {
-      debugLog('fetchHistoryPage: sessionController.page is not a function')
+    if (!controller) {
+      debugLog('fetchHistoryPage: no sessionController on this host')
       return undefined
     }
-    try {
-      // The host's `page(request, signal)` starts with `signal.throwIfAborted()`,
-      // so omitting the signal throws a TypeError before any read happens. That
-      // was the 0.12.0 "/history" failure ("хост не отдал страницу сессии").
-      // The bound keeps a hung persistence read from pinning the poller forever.
-      const res = await page.call(controller, {
-        address: { kind: 'session', sessionId },
-        throughSeq: -1,
-        maxMessages,
-        ...(beforeSeq !== undefined ? { beforeSeq } : {}),
-      }, AbortSignal.timeout(HOST_CALL_TIMEOUT_MS))
-      const records = res?.records ?? []
-      const blocks: string[] = []
-      let earliest: number | undefined
-      for (const record of records) {
-        const event = record?.event
-        if (!event?.type) continue
-        if (typeof event.seq === 'number' && (earliest === undefined || event.seq < earliest)) earliest = event.seq
-        const data = (event.data ?? {}) as {
-          message?: { content?: unknown }
-          source?: { kind?: string }
-          name?: string
-          arguments?: unknown
-        }
-        if (event.type === 'user/message') {
-          if (data.source?.kind !== undefined && data.source.kind !== 'user') continue
-          const text = contentToText(data.message?.content)
-          if (text.trim()) blocks.push(`👤 <b>Вы</b>\n${escapeHtml(text)}`)
-        } else if (event.type === 'assistant/message') {
-          const content = data.message?.content
-          const text = contentToText(content)
-          // Reasoning first, like the live mirror: thought → answer.
-          const reasoning = opts.reasoning ? reasoningToText(content).trim() : ''
-          if (reasoning.length > 0) blocks.push(this.spoilerBlock(MSG.REASONING_TITLE, reasoning))
-          if (text.trim()) blocks.push(`🤖 <b>Ассистент</b>\n${escapeHtml(text)}`)
-        } else if (event.type === 'tool/call') {
-          if (!opts.tools) continue
-          const args = typeof data.arguments === 'string' ? data.arguments : JSON.stringify(data.arguments ?? {})
-          blocks.push(this.spoilerBlock(`🛠 ${escapeHtml(String(data.name ?? 'tool'))}`, args))
-        }
+    const { page, follow } = controller
+    if (typeof page !== 'function' && typeof follow !== 'function') {
+      debugLog('fetchHistoryPage: sessionController has neither page() nor follow()')
+      return undefined
+    }
+    const address: Address = { kind: 'session', sessionId }
+    const logCursor = typeof cursor === 'number' ? cursor : await this.sessionLogCursor(sessionId)
+
+    // The cheap, non-activating read — newest page or an older one via beforeSeq.
+    if (typeof page === 'function' && logCursor !== undefined) {
+      try {
+        const res = await page.call(controller, {
+          address,
+          throughSeq: logCursor,
+          maxMessages,
+          ...(beforeSeq === undefined ? {} : { beforeSeq }),
+        }, AbortSignal.timeout(HOST_CALL_TIMEOUT_MS))
+        return this.renderHistoryPage(res?.records, Boolean(res?.hasMore), logCursor, opts)
+      } catch (err) {
+        // Compacted/rotated log or a stale cursor: re-derive it and retry once.
+        debugLog(`history page(throughSeq=${logCursor}, beforeSeq=${beforeSeq}) failed: ${String(err)}`)
       }
-      return { blocks, earliestSeq: earliest, hasMore: Boolean(res?.hasMore) }
-    } catch (err) {
-      this.ctx.logger.warn(`dsh-telegram-channel: history page failed: ${this.redact(err)}`)
-      // `ctx.logger` output is not visible in the service journal on this host,
-      // so mirror the reason into the plugin debug log where it can be read.
-      debugLog(`fetchHistoryPage failed: ${String(err)}`)
-      return undefined
     }
+
+    // Last resort: the host's snapshot frame carries the cursor, but follow()
+    // activates a cold session, so this path is deliberately second.
+    if (typeof follow === 'function') {
+      try {
+        const stream = follow.call(controller, { address, maxMessages },
+          AbortSignal.timeout(HOST_CALL_TIMEOUT_MS))
+        for await (const frame of stream) {
+          if (frame?.type !== 'snapshot') continue
+          return this.renderHistoryPage(frame.records, Boolean(frame.hasMore), frame.cursor, opts)
+        }
+        debugLog('history follow: stream ended without a snapshot frame')
+        return undefined
+      } catch (err) {
+        this.ctx.logger.warn(`dsh-telegram-channel: history snapshot failed: ${this.redact(err)}`)
+        debugLog(`history follow failed: ${String(err)}`)
+        return undefined
+      }
+    }
+
+    // Host with page() but neither a cursor source nor follow(): the old call.
+    // On DSH 0.2 this yields an empty page (see the comment above), but a host
+    // that accepts -1 still answers instead of failing the command.
+    if (typeof page === 'function') {
+      try {
+        const res = await page.call(controller, {
+          address,
+          throughSeq: -1,
+          maxMessages,
+          ...(beforeSeq === undefined ? {} : { beforeSeq }),
+        }, AbortSignal.timeout(HOST_CALL_TIMEOUT_MS))
+        return this.renderHistoryPage(res?.records, Boolean(res?.hasMore), cursor, opts)
+      } catch (err) {
+        this.ctx.logger.warn(`dsh-telegram-channel: history page failed: ${this.redact(err)}`)
+        debugLog(`fetchHistoryPage failed: ${String(err)}`)
+        return undefined
+      }
+    }
+    return undefined
+  }
+
+  /**
+   * Session log cursor without activating the Agent (`page()` needs it).
+   * `observeSession(id, {projectionMode: 'none'})` is the same read the host's
+   * own `page()` performs, so it has no side effects on the session.
+   */
+  private async sessionLogCursor(sessionId: string): Promise<number | undefined> {
+    const query = hostService<{
+      observeSession?: (
+        id: string,
+        options?: { signal?: AbortSignal; projectionMode?: 'none' | 'all' },
+      ) => Promise<Record<symbol, unknown> & { cursor?: number }>
+    }>(this.ctx, 'sessionQuery')
+    const observe = query?.observeSession
+    if (typeof observe !== 'function') return undefined
+    let observation: (Record<symbol, unknown> & { cursor?: number }) | undefined
+    try {
+      observation = await observe.call(query, sessionId, {
+        signal: AbortSignal.timeout(HOST_CALL_TIMEOUT_MS),
+        projectionMode: 'none',
+      })
+      return typeof observation?.cursor === 'number' ? observation.cursor : undefined
+    } catch (err) {
+      debugLog(`sessionQuery.observeSession failed: ${String(err)}`)
+      return undefined
+    } finally {
+      const dispose = observation?.[Symbol.dispose]
+      if (typeof dispose === 'function') {
+        try { (dispose as () => void).call(observation) } catch {}
+      }
+    }
+  }
+
+  /** Turn raw page records into Telegram blocks (reasoning and tool calls per prefs). */
+  private renderHistoryPage(
+    records: Array<{ event?: { type?: string; seq?: number; data?: Record<string, unknown> } }> | undefined,
+    hasMore: boolean,
+    cursor: number | undefined,
+    opts: { tools: boolean; reasoning: boolean },
+  ): { blocks: string[]; earliestSeq?: number; hasMore: boolean; cursor?: number } {
+    const blocks: string[] = []
+    let earliest: number | undefined
+    for (const record of records ?? []) {
+      const event = record?.event
+      if (!event?.type) continue
+      if (typeof event.seq === 'number' && (earliest === undefined || event.seq < earliest)) earliest = event.seq
+      const data = (event.data ?? {}) as {
+        message?: { content?: unknown }
+        source?: { kind?: string }
+        name?: string
+        arguments?: unknown
+      }
+      if (event.type === 'user/message') {
+        if (data.source?.kind !== undefined && data.source.kind !== 'user') continue
+        const text = contentToText(data.message?.content)
+        if (text.trim()) blocks.push(`👤 <b>Вы</b>\n${escapeHtml(text)}`)
+      } else if (event.type === 'assistant/message') {
+        const content = data.message?.content
+        const text = contentToText(content)
+        // Reasoning first, like the live mirror: thought → answer.
+        const reasoning = opts.reasoning ? reasoningToText(content).trim() : ''
+        if (reasoning.length > 0) blocks.push(this.spoilerBlock(MSG.REASONING_TITLE, reasoning))
+        if (text.trim()) blocks.push(`🤖 <b>Ассистент</b>\n${escapeHtml(text)}`)
+      } else if (event.type === 'tool/call') {
+        if (!opts.tools) continue
+        const args = typeof data.arguments === 'string' ? data.arguments : JSON.stringify(data.arguments ?? {})
+        blocks.push(this.spoilerBlock(`🛠 ${escapeHtml(String(data.name ?? 'tool'))}`, args))
+      }
+    }
+    return { blocks, earliestSeq: earliest, hasMore, ...(cursor === undefined ? {} : { cursor }) }
   }
 
   /** Send a history page to the chat: paging plus a tool-calls on/off toggle. */
   private async sendHistoryPage(chatId: number, sessionId: string, beforeSeq?: number): Promise<void> {
     const tools = this.showHistoryTools(chatId)
+    // The host's page() reader needs the session log cursor, and only the
+    // snapshot frame hands it out: keep it per session for "earlier" pages.
+    const known = this.historyCursors.get(String(chatId))
+    const cursor = known?.sessionId === sessionId ? known.cursor : undefined
     const page = await this.fetchHistoryPage(sessionId, beforeSeq, 10, {
       tools,
       reasoning: this.showReasoning(chatId),
-    })
+    }, cursor)
     if (!page) {
       await this.client.sendMessage(chatId, 'История недоступна: хост не отдал страницу сессии.')
       return
@@ -3553,6 +3649,7 @@ export class TelegramBridge {
       sessionId,
       beforeSeq: page.earliestSeq,
       prevBeforeSeq: beforeSeq,
+      ...(page.cursor === undefined ? {} : { cursor: page.cursor }),
     })
     await this.client.sendMessage(
       chatId,

@@ -371,10 +371,26 @@ export declare class TelegramBridge {
     private unarchiveSessionById;
     /**
      * One page of real session history: user/assistant messages, the model's
-     * reasoning (spoiler) and — when the chat wants them — tool calls as spoilers,
-     * via the host session controller, newest page by default.
+     * reasoning (spoiler) and — when the chat wants them — tool calls as spoilers.
+     *
+     * The whole trick is the cursor. `page({throughSeq: -1})` is NOT "latest" on
+     * DSH 0.2: the host computes `end = min(throughSeq + 1, …) = 0` and returns an
+     * empty page. That is the "Нет истории" bug — 0.12.x asked for `-1` and every
+     * session answered "Сообщений в сессии пока нет". A page needs the Session's
+     * log cursor, which comes from `sessionQuery.observeSession()` — the same
+     * non-activating read `page()` itself does. Only when that service is out of
+     * reach do we fall back to the `follow()` snapshot frame, because `follow()`
+     * promotes a cold session into a live Agent.
      */
     private fetchHistoryPage;
+    /**
+     * Session log cursor without activating the Agent (`page()` needs it).
+     * `observeSession(id, {projectionMode: 'none'})` is the same read the host's
+     * own `page()` performs, so it has no side effects on the session.
+     */
+    private sessionLogCursor;
+    /** Turn raw page records into Telegram blocks (reasoning and tool calls per prefs). */
+    private renderHistoryPage;
     /** Send a history page to the chat: paging plus a tool-calls on/off toggle. */
     private sendHistoryPage;
     /** Controls under a history page: "earlier" (when known) + tool-calls toggle. */
