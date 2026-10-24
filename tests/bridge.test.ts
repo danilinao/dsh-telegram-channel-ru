@@ -1897,7 +1897,8 @@ test('/history renders a host page and passes the required AbortSignal', async (
   })
   bindDirectly(bridge, 10, 'h1')
   await bridge.processUpdate(messageUpdate(10, 1, '/history'))
-  assert.equal(sent.length, 1, JSON.stringify(sent.map((m) => m.text)))
+  // The page itself plus the control caption (paging / tool-calls toggle).
+  assert.equal(sent.length, 2, JSON.stringify(sent.map((m) => m.text)))
   assert.match(sent[0]!.text, /привет/)
   assert.match(sent[0]!.text, /здравствуйте/)
   assert.doesNotMatch(sent[0]!.text, /История недоступна/)
@@ -1931,5 +1932,139 @@ test('/history reports the friendly message when the host has no page()', async 
   await bridge.processUpdate(messageUpdate(10, 1, '/history'))
   assert.equal(sent.length, 1)
   assert.equal(sent[0]!.text, 'История недоступна: хост не отдал страницу сессии.')
+  await bridge.stop()
+})
+
+/**
+ * 0.13.0 `/history`: besides answers the page now carries the model's reasoning
+ * (a spoiler, read from the `reasoning` content blocks persisted inside
+ * `assistant/message` — verified against a real session store), and a chat can
+ * turn the tool-call spoilers off. The toggle is persisted per chat.
+ */
+type HistoryCtxOptions = { records?: unknown[]; hasMore?: boolean }
+
+function historyCtx(options: HistoryCtxOptions = {}) {
+  const calls: Array<Record<string, unknown>> = []
+  const records = options.records ?? [
+    {
+      event: {
+        type: 'user/message',
+        seq: 0,
+        data: { source: { kind: 'user' }, message: { content: [{ type: 'text', text: 'вопрос' }] } },
+      },
+    },
+    {
+      event: {
+        type: 'assistant/message',
+        seq: 1,
+        data: {
+          message: {
+            content: [
+              { type: 'reasoning', text: 'думаю про X' },
+              { type: 'text', text: 'ответ Т' },
+            ],
+          },
+        },
+      },
+    },
+    { event: { type: 'tool/call', seq: 2, data: { name: 'read_file', arguments: '{"path":"a.ts"}' } } },
+  ]
+  const ctx = {
+    logger: { info() {}, warn() {}, error() {} },
+    agents: { list: () => [], roots: () => [], get: () => undefined },
+    get(name: string) {
+      if (name !== 'sessionController') return undefined
+      return {
+        page: async (request: Record<string, unknown>, signal?: AbortSignal) => {
+          if (signal === undefined || typeof signal.throwIfAborted !== 'function') {
+            throw new TypeError("Cannot read properties of undefined (reading 'throwIfAborted')")
+          }
+          calls.push(request)
+          return { records, hasMore: options.hasMore ?? false }
+        },
+      }
+    },
+    on() { return () => {} },
+  }
+  return { ctx, calls }
+}
+
+test('/history shows reasoning and tool calls, and /history tools off hides the calls', async () => {
+  const sent: SentMessage[] = []
+  const { ctx } = historyCtx()
+  const bridge = new TelegramBridge(ctx as any, {
+    token: 't',
+    allowedUserIds: [1],
+    allowAllUsers: false,
+    client: fakeClient(sent),
+    sleep: async () => {},
+  })
+  bindDirectly(bridge, 10, 'h1')
+
+  await bridge.processUpdate(messageUpdate(10, 1, '/history'))
+  const page = sent.map((m) => m.text).join('\n')
+  assert.match(page, /🧠 Рассуждения/)
+  assert.match(page, /думаю про X/)
+  assert.match(page, /ответ Т/)
+  assert.match(page, /read_file/)
+  // Reasoning goes above the answer, like the live mirror.
+  assert.ok(page.indexOf('думаю про X') < page.indexOf('ответ Т'))
+  const toggle = sent.at(-1)!.replyMarkup?.inline_keyboard?.flat()
+    .find((button) => button.callback_data === 'ht:off')
+  assert.ok(toggle, 'page must offer a "hide tool calls" button')
+  assert.equal(toggle!.text, MSG.HISTORY_TOOLS_ON)
+
+  sent.length = 0
+  await bridge.processUpdate(messageUpdate(10, 1, '/history tools off'))
+  assert.match(sent.at(-1)!.text, /скрыты/)
+
+  sent.length = 0
+  await bridge.processUpdate(messageUpdate(10, 1, '/history'))
+  const clean = sent.map((m) => m.text).join('\n')
+  assert.match(clean, /думаю про X/, 'reasoning stays visible')
+  assert.match(clean, /ответ Т/)
+  assert.doesNotMatch(clean, /read_file/, 'tool calls are gone')
+  assert.ok(sent.at(-1)!.replyMarkup?.inline_keyboard?.flat().some((b) => b.callback_data === 'ht:on'))
+  await bridge.stop()
+})
+
+test('the history toggle button re-renders the same page', async () => {
+  const sent: SentMessage[] = []
+  const { ctx, calls } = historyCtx()
+  const bridge = new TelegramBridge(ctx as any, {
+    token: 't',
+    allowedUserIds: [1],
+    allowAllUsers: false,
+    client: fakeClient(sent),
+    sleep: async () => {},
+  })
+  bindDirectly(bridge, 10, 'h1')
+  await bridge.processUpdate(messageUpdate(10, 1, '/history'))
+  sent.length = 0
+
+  await bridge.processUpdate(callbackUpdate(10, 1, 'ht:off'))
+  const page = sent.map((m) => m.text).join('\n')
+  assert.match(page, /думаю про X/)
+  assert.doesNotMatch(page, /read_file/)
+  assert.equal(calls.length, 2)
+  // Re-render of the first page: no cursor, i.e. still the newest page.
+  assert.equal('beforeSeq' in calls[1]!, false)
+  await bridge.stop()
+})
+
+test('/history tools with no argument reports the current state', async () => {
+  const sent: SentMessage[] = []
+  const { ctx, calls } = historyCtx()
+  const bridge = new TelegramBridge(ctx as any, {
+    token: 't',
+    allowedUserIds: [1],
+    allowAllUsers: false,
+    client: fakeClient(sent),
+    sleep: async () => {},
+  })
+  bindDirectly(bridge, 10, 'h1')
+  await bridge.processUpdate(messageUpdate(10, 1, '/history tools'))
+  assert.match(sent.at(-1)!.text, /Вызовы инструментов в \/history показываются/)
+  assert.equal(calls.length, 0, 'asking for the state must not fetch a page')
   await bridge.stop()
 })

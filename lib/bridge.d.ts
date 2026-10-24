@@ -51,6 +51,8 @@ export declare class TelegramBridge {
     private readonly renderPrefs;
     /** chatId → присылать рассуждения спойлером (по умолчанию да; persisted). */
     private readonly reasoningPrefs;
+    /** chatId → показывать вызовы инструментов в /history (по умолчанию да; persisted). */
+    private readonly historyToolPrefs;
     private readonly bindings;
     private readonly pickers;
     /** Session names fetched from host projections, keyed by id and updatedAt. */
@@ -322,8 +324,10 @@ export declare class TelegramBridge {
     private handleApprovalCallback;
     private stopBound;
     private sendMission;
-    /** /history [beforeSeq]: показать предыдущие сообщения сессии. */
+    /** /history [beforeSeq] | /history tools on|off: история сессии и её настройки. */
     private handleHistoryCommand;
+    /** `/history tools [on|off]` — помнить, показывать ли вызовы инструментов. */
+    private handleHistoryToolsCommand;
     /** /find <text>: search session titles and folders, then bind with a button. */
     private handleFindCommand;
     /** /new: create a session in the bound session's workspace and attach to it. */
@@ -366,12 +370,17 @@ export declare class TelegramBridge {
     /** Restore one session from the archive (host registry, DSH 0.2). */
     private unarchiveSessionById;
     /**
-     * One page of real session history (user/assistant messages and tool calls as
-     * spoilers) via the host session controller, newest page by default.
+     * One page of real session history: user/assistant messages, the model's
+     * reasoning (spoiler) and — when the chat wants them — tool calls as spoilers,
+     * via the host session controller, newest page by default.
      */
     private fetchHistoryPage;
-    /** Send a history page to the chat, with a "earlier" button when available. */
+    /** Send a history page to the chat: paging plus a tool-calls on/off toggle. */
     private sendHistoryPage;
+    /** Controls under a history page: "earlier" (when known) + tool-calls toggle. */
+    private historyKeyboard;
+    /** Whether this chat wants tool calls in /history (default: yes). */
+    private showHistoryTools;
     private bindingsPath;
     private saveBindings;
     private loadBindings;

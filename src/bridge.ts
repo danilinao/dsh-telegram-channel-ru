@@ -28,6 +28,7 @@ import {
 } from './catalog.js'
 import {
   TelegramClient,
+  type InlineKeyboardButton,
   type InlineKeyboardMarkup,
   type TelegramClientLike,
   type TelegramMessage,
@@ -269,6 +270,8 @@ const NEW_WS_CB = 'nw'
 const UNARC_CB = 'unarc:'
 /** Пролистать историю назад: hist:<beforeSeq>. */
 const HIST_CB = 'hist:'
+/** Переключить вызовы инструментов в истории: ht:on | ht:off. */
+const HIST_TOOLS_CB = 'ht:'
 /** Показать архивные сессии области: arcl:<индекс области>. */
 const ARCLIST_CB = 'arcl:'
 /** Вернуться к списку сессий области: bs */
@@ -336,6 +339,8 @@ export class TelegramBridge {
   private readonly renderPrefs = new Map<string, 'rich' | 'html'>()
   /** chatId → присылать рассуждения спойлером (по умолчанию да; persisted). */
   private readonly reasoningPrefs = new Map<string, boolean>()
+  /** chatId → показывать вызовы инструментов в /history (по умолчанию да; persisted). */
+  private readonly historyToolPrefs = new Map<string, boolean>()
 
   private readonly bindings = new Map<string, Binding>()
   private readonly pickers = new Map<string, PickerState>()
@@ -364,7 +369,13 @@ export class TelegramBridge {
   /** sessionId → накопленные рассуждения текущего шага (уходят спойлером). */
   private readonly reasoningBuffers = new Map<string, string>()
   /** chatId → курсор для листания истории (beforeSeq) и признак «есть ещё». */
-  private readonly historyCursors = new Map<string, { sessionId: string; beforeSeq?: number }>()
+  private readonly historyCursors = new Map<string, {
+    sessionId: string
+    /** Курсор для кнопки «Раньше» (earliestSeq показанной страницы). */
+    beforeSeq?: number
+    /** beforeSeq, с которым была показана текущая страница: нужен для перерисовки. */
+    prevBeforeSeq?: number
+  }>()
   /** chatId → model awaiting reasoning-effort pick (kept outside picker so list refreshes won't drop it). */
   private readonly pendingModels = new Map<string, ModelOption>()
   private polling = false
@@ -521,6 +532,7 @@ export class TelegramBridge {
     this.bindings.clear()
     this.renderPrefs.clear()
     this.reasoningPrefs.clear()
+    this.historyToolPrefs.clear()
     this.pickers.clear()
     this.pendingModels.clear()
     this.stopAllHeartbeats()
@@ -953,6 +965,21 @@ export class TelegramBridge {
         return
       }
       await this.bindSession(chatId, cq.id, row)
+      return
+    }
+    if (data.startsWith(HIST_TOOLS_CB)) {
+      const on = data.slice(HIST_TOOLS_CB.length) !== 'off'
+      this.historyToolPrefs.set(String(chatId), on)
+      this.saveBindings()
+      await this.client.answerCallbackQuery(cq.id, on ? 'Вызовы показаны' : 'Вызовы скрыты')
+      const cursor = this.historyCursors.get(String(chatId))
+      const sessionId = cursor?.sessionId ?? this.bindings.get(String(chatId))?.sessionId
+      if (!sessionId) {
+        await this.client.sendMessage(chatId, MSG.NEED_BIND)
+        return
+      }
+      // Re-render the same page with the new setting.
+      await this.sendHistoryPage(chatId, sessionId, cursor?.prevBeforeSeq)
       return
     }
     if (data.startsWith(HIST_CB)) {
@@ -2948,15 +2975,53 @@ export class TelegramBridge {
     await this.client.sendMessage(chatId, lines.join('\n'))
   }
 
-  /** /history [beforeSeq]: показать предыдущие сообщения сессии. */
+  /** /history [beforeSeq] | /history tools on|off: история сессии и её настройки. */
   private async handleHistoryCommand(chatId: number, arg?: string): Promise<void> {
+    const words = (arg ?? '').trim().toLowerCase().split(/\s+/).filter(Boolean)
+    if (words[0] === 'tools' || words[0] === 'tool' || words[0] === 'calls') {
+      await this.handleHistoryToolsCommand(chatId, words[1])
+      return
+    }
     const binding = this.bindings.get(String(chatId))
     if (!binding) {
       await this.client.sendMessage(chatId, MSG.NEED_BIND)
       return
     }
-    const raw = Number((arg ?? '').trim())
+    const raw = Number(words[0] ?? '')
     await this.sendHistoryPage(chatId, binding.sessionId, Number.isFinite(raw) && raw > 0 ? raw : undefined)
+  }
+
+  /** `/history tools [on|off]` — помнить, показывать ли вызовы инструментов. */
+  private async handleHistoryToolsCommand(chatId: number, mode?: string): Promise<void> {
+    const key = String(chatId)
+    switch (mode) {
+      case 'on':
+      case 'show':
+      case 'yes':
+        this.historyToolPrefs.set(key, true)
+        this.saveBindings()
+        await this.client.sendMessage(chatId, MSG.HISTORY_TOOLS_SET(true))
+        return
+      case 'off':
+      case 'hide':
+      case 'no':
+        this.historyToolPrefs.set(key, false)
+        this.saveBindings()
+        await this.client.sendMessage(chatId, MSG.HISTORY_TOOLS_SET(false))
+        return
+      case 'auto':
+      case 'default':
+      case 'reset':
+        this.historyToolPrefs.delete(key)
+        this.saveBindings()
+        await this.client.sendMessage(chatId, MSG.HISTORY_TOOLS_STATE(true))
+        return
+      case undefined:
+        await this.client.sendMessage(chatId, MSG.HISTORY_TOOLS_STATE(this.showHistoryTools(chatId)))
+        return
+      default:
+        await this.client.sendMessage(chatId, MSG.HISTORY_USAGE)
+    }
   }
 
   /** /find <text>: search session titles and folders, then bind with a button. */
@@ -3374,13 +3439,15 @@ export class TelegramBridge {
   }
 
   /**
-   * One page of real session history (user/assistant messages and tool calls as
-   * spoilers) via the host session controller, newest page by default.
+   * One page of real session history: user/assistant messages, the model's
+   * reasoning (spoiler) and — when the chat wants them — tool calls as spoilers,
+   * via the host session controller, newest page by default.
    */
   private async fetchHistoryPage(
     sessionId: string,
     beforeSeq?: number,
     maxMessages = 10,
+    opts: { tools: boolean; reasoning: boolean } = { tools: true, reasoning: true },
   ): Promise<{ blocks: string[]; earliestSeq?: number; hasMore: boolean } | undefined> {
     const controller = hostService<{
       page?: (
@@ -3430,9 +3497,14 @@ export class TelegramBridge {
           const text = contentToText(data.message?.content)
           if (text.trim()) blocks.push(`👤 <b>Вы</b>\n${escapeHtml(text)}`)
         } else if (event.type === 'assistant/message') {
-          const text = contentToText(data.message?.content)
+          const content = data.message?.content
+          const text = contentToText(content)
+          // Reasoning first, like the live mirror: thought → answer.
+          const reasoning = opts.reasoning ? reasoningToText(content).trim() : ''
+          if (reasoning.length > 0) blocks.push(this.spoilerBlock(MSG.REASONING_TITLE, reasoning))
           if (text.trim()) blocks.push(`🤖 <b>Ассистент</b>\n${escapeHtml(text)}`)
         } else if (event.type === 'tool/call') {
+          if (!opts.tools) continue
           const args = typeof data.arguments === 'string' ? data.arguments : JSON.stringify(data.arguments ?? {})
           blocks.push(this.spoilerBlock(`🛠 ${escapeHtml(String(data.name ?? 'tool'))}`, args))
         }
@@ -3447,15 +3519,22 @@ export class TelegramBridge {
     }
   }
 
-  /** Send a history page to the chat, with a "earlier" button when available. */
+  /** Send a history page to the chat: paging plus a tool-calls on/off toggle. */
   private async sendHistoryPage(chatId: number, sessionId: string, beforeSeq?: number): Promise<void> {
-    const page = await this.fetchHistoryPage(sessionId, beforeSeq)
+    const tools = this.showHistoryTools(chatId)
+    const page = await this.fetchHistoryPage(sessionId, beforeSeq, 10, {
+      tools,
+      reasoning: this.showReasoning(chatId),
+    })
     if (!page) {
       await this.client.sendMessage(chatId, 'История недоступна: хост не отдал страницу сессии.')
       return
     }
     if (page.blocks.length === 0) {
-      await this.client.sendMessage(chatId, beforeSeq === undefined ? 'Сообщений в сессии пока нет.' : 'Раньше сообщений нет.')
+      const empty = beforeSeq === undefined ? 'Сообщений в сессии пока нет.' : 'Раньше сообщений нет.'
+      // Nothing rendered, but the toggle still has to be reachable (the last page
+      // may hold nothing except hidden tool calls).
+      await this.client.sendMessage(chatId, empty, undefined, this.historyKeyboard(false, tools))
       return
     }
     // Group events into messages below the Telegram limit.
@@ -3470,12 +3549,39 @@ export class TelegramBridge {
       buffer = buffer ? `${buffer}\n\n${block}` : block
     }
     await flush()
-    this.historyCursors.set(String(chatId), { sessionId, beforeSeq: page.earliestSeq })
-    if (page.hasMore && page.earliestSeq !== undefined) {
-      await this.client.sendMessage(chatId, 'Показаны последние сообщения. Ранее:', undefined, {
-        inline_keyboard: [[{ text: '⬅ Раньше', callback_data: `${HIST_CB}${page.earliestSeq}` }]],
-      })
+    this.historyCursors.set(String(chatId), {
+      sessionId,
+      beforeSeq: page.earliestSeq,
+      prevBeforeSeq: beforeSeq,
+    })
+    await this.client.sendMessage(
+      chatId,
+      page.hasMore ? 'Показаны последние сообщения. Ранее:' : 'Вся история сессии.',
+      undefined,
+      this.historyKeyboard(page.hasMore, tools, page.earliestSeq),
+    )
+  }
+
+  /** Controls under a history page: "earlier" (when known) + tool-calls toggle. */
+  private historyKeyboard(
+    hasMore: boolean,
+    tools: boolean,
+    earliestSeq?: number,
+  ): InlineKeyboardMarkup {
+    const rows: InlineKeyboardButton[][] = []
+    if (hasMore && earliestSeq !== undefined) {
+      rows.push([{ text: MSG.HISTORY_EARLIER, callback_data: `${HIST_CB}${earliestSeq}` }])
     }
+    rows.push([{
+      text: tools ? MSG.HISTORY_TOOLS_ON : MSG.HISTORY_TOOLS_OFF,
+      callback_data: `${HIST_TOOLS_CB}${tools ? 'off' : 'on'}`,
+    }])
+    return { inline_keyboard: rows }
+  }
+
+  /** Whether this chat wants tool calls in /history (default: yes). */
+  private showHistoryTools(chatId: number): boolean {
+    return this.historyToolPrefs.get(String(chatId)) !== false
   }
 
   private bindingsPath(): string {
@@ -3493,6 +3599,7 @@ export class TelegramBridge {
         bindings: Object.fromEntries(this.bindings),
         renderPrefs: Object.fromEntries(this.renderPrefs),
         reasoningPrefs: Object.fromEntries([...this.reasoningPrefs].map(([chatId, on]) => [chatId, on ? 'on' : 'off'])),
+        historyTools: Object.fromEntries([...this.historyToolPrefs].map(([chatId, on]) => [chatId, on ? 'on' : 'off'])),
         notifyPrefs: Object.fromEntries(this.notifyPrefs),
         notifyScope: Object.fromEntries(this.notifyScope),
         knownChats: [...this.knownChats],
@@ -3516,6 +3623,7 @@ export class TelegramBridge {
         bindings?: Record<string, { chatId?: number; sessionId?: string; label?: string }>
         renderPrefs?: Record<string, string>
         reasoningPrefs?: Record<string, string>
+        historyTools?: Record<string, string>
         notifyPrefs?: Record<string, string>
         notifyScope?: Record<string, string>
         knownChats?: number[]
@@ -3544,6 +3652,10 @@ export class TelegramBridge {
       for (const [chatId, mode] of Object.entries(data.reasoningPrefs ?? {})) {
         if (mode === 'on') this.reasoningPrefs.set(String(chatId), true)
         else if (mode === 'off') this.reasoningPrefs.set(String(chatId), false)
+      }
+      for (const [chatId, mode] of Object.entries(data.historyTools ?? {})) {
+        if (mode === 'on') this.historyToolPrefs.set(String(chatId), true)
+        else if (mode === 'off') this.historyToolPrefs.set(String(chatId), false)
       }
       for (const [chatId, mode] of Object.entries(data.notifyPrefs ?? {})) {
         if (mode === 'all' || mode === 'errors' || mode === 'off') {

@@ -85,6 +85,13 @@ export declare const MSG: {
     readonly CONTINUE_TEXT: "Продолжай с того места, где остановился.";
     readonly NTF_LAST_BUTTON: "📜 Последний ответ";
     readonly NTF_HIST_BUTTON: "📖 История";
+    /** History-page toggle: label states what is shown *now*. */
+    readonly HISTORY_TOOLS_ON: "🛠 Вызовы: вкл";
+    readonly HISTORY_TOOLS_OFF: "🛠 Вызовы: выкл";
+    readonly HISTORY_EARLIER: "⬅ Раньше";
+    readonly HISTORY_USAGE: "Использование: /history [seq] — страница истории; /history tools on|off — показывать вызовы инструментов (для этого чата)";
+    readonly HISTORY_TOOLS_STATE: (on: boolean) => string;
+    readonly HISTORY_TOOLS_SET: (on: boolean) => string;
     readonly FIND_USAGE: "Использование: /find <текст> — поиск сессий по названию или папке";
     readonly FIND_NONE: (q: string) => string;
     readonly FIND_HEADER: (q: string, n: number) => string;

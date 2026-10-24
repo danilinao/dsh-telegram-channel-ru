@@ -48,3 +48,14 @@ test('parse /compact', () => {
   assert.equal(parseCommand('/compact@MyBot').type, 'compact')
   assert.equal(parseCommand('/compact now').type, 'compact')
 })
+
+test('parse /history keeps the whole tail (seq or a tools subcommand)', () => {
+  const bare = parseCommand('/history')
+  assert.equal(bare.type === 'history' ? bare.arg : 'x', '')
+  const seq = parseCommand('/history 42')
+  assert.equal(seq.type === 'history' ? seq.arg : 'x', '42')
+  const tools = parseCommand('/history tools off')
+  assert.equal(tools.type === 'history' ? tools.arg : 'x', 'tools off')
+  // `/log` is the same command under another name.
+  assert.equal(parseCommand('/log tools on').type, 'history')
+})

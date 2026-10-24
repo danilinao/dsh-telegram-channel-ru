@@ -64,8 +64,10 @@ Telegram-пульт для **DeepSeek Harness**: телефон подключа
   (по умолчанию они включены).
 - **История при открытии сессии.** При привязке сразу показываются последние
   сообщения диалога; кнопка «⬅ Раньше» листает глубже, `/history [seq]` — тоже
-  вручную. В истории видны реплики пользователя, ответы ассистента и вызовы
-  инструментов (спойлером).
+  вручную. В истории видны реплики пользователя, ответы ассистента и рассуждения
+  модели («🧠 Рассуждения» спойлером), а вызовы инструментов — спойлером «🛠 имя»
+  и их можно убрать: `/history tools off` или кнопка «🛠 Вызовы» под страницей
+  (запоминается для чата, по умолчанию они показаны).
 - **Архив отдельно от списка.** В списке сессий области только неархивные; ниже
   кнопка «🗂 Архивные (N)» — она открывает архив **этой области** с кнопкой «↩»
   (вернуть) и «← К сессиям». Глобальный архив тоже доступен: `/archived`.
@@ -213,7 +215,8 @@ dsh-telegram-channel-ru**): обе стороны — один компонен�
 | `/newproject <путь> [\| Название]` | добавить папку как проект (рабочую область) |
 | `/archive` | убрать привязанную сессию в архив |
 | `/archived` | список архива, кнопка «↩» возвращает сессию |
-| `/history [seq]` | предыдущие сообщения сессии (листается «⬅ Раньше») |
+| `/history [seq]` | предыдущие сообщения сессии: вопросы, ответы и рассуждения (листается «⬅ Раньше») |
+| `/history tools on\|off` | показывать вызовы инструментов в истории (по умолчанию `on`, запоминается для чата) |
 | `/retry` | повторить последний отправленный запрос (после ошибки) |
 | `/find <текст>` | найти сессии по названию или папке и привязаться кнопкой |
 | `/notify on\|errors\|off` | какие события присылать (всё / только ошибки / ничего) |
@@ -319,8 +322,9 @@ sync/publish workflow.
   out of the way until tapped.
 - **Conversation history on attach.** Binding a session immediately shows the last
   messages; the "⬅ Earlier" button pages further back, and `/history [seq]` does
-  it manually. User prompts, assistant replies and tool calls (as spoilers) are
-  all included.
+  it manually. User prompts, assistant replies and the model's reasoning ("🧠"
+  spoiler) are always included; tool calls ("🛠" spoiler) can be hidden with
+  `/history tools off` or the "🛠 Calls" button under the page (per chat).
 - **Archive kept apart.** The session list shows only non-archived sessions; a
   "🗂 Архивные (N)" button opens the archive of **that workspace** with "↩"
   (restore) and "← К сессиям" (back). The global archive is `/archived`.
@@ -447,7 +451,8 @@ session, exactly as the single owner could. Add people deliberately and keep
 | `/newproject <path> [\| Title]` | register a folder as a project (workspace) |
 | `/archive` | move the attached session to the archive |
 | `/archived` | archived sessions, "↩" restores one |
-| `/history [seq]` | earlier messages of the session ("⬅ Earlier" pages back) |
+| `/history [seq]` | earlier messages of the session: prompts, replies, reasoning ("⬅ Earlier" pages back) |
+| `/history tools on\|off` | show tool calls in the history (default `on`, per chat) |
 | `/retry` | resend the last prompt (after an error) |
 | `/find <text>` | find sessions by title or folder and attach with a button |
 | `/notify on\|errors\|off` | which events this chat receives (all / errors only / none) |
