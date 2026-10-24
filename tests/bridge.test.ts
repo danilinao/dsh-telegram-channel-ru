@@ -1833,3 +1833,103 @@ test('/find searches session titles and offers bind buttons', async () => {
   assert.equal(sent[0]!.replyMarkup?.inline_keyboard?.[0]?.[0]?.callback_data, 'sid:0')
   await bridge.stop()
 })
+
+/**
+ * 0.12.0 shipped `/history` without the AbortSignal argument. The host's
+ * `sessionController.page(request, signal)` starts with `signal.throwIfAborted()`,
+ * so the call threw a TypeError before reading anything and the bot answered
+ * "История недоступна: хост не отдал страницу сессии." These two tests pin the
+ * host-shaped contract: a signal is mandatory, and a host without `page()`
+ * still degrades to the friendly message.
+ */
+function bindDirectly(bridge: TelegramBridge, chatId: number, sessionId: string): void {
+  const internals = bridge as unknown as {
+    bindings: Map<string, { chatId: number; sessionId: string; label: string }>
+  }
+  internals.bindings.set(String(chatId), { chatId, sessionId, label: 'Демо-сессия' })
+}
+
+test('/history renders a host page and passes the required AbortSignal', async () => {
+  const sent: SentMessage[] = []
+  const calls: Array<{ request: Record<string, unknown>; signal: unknown }> = []
+  const ctx = {
+    logger: { info() {}, warn() {}, error() {} },
+    agents: { list: () => [], roots: () => [], get: () => undefined },
+    get(name: string) {
+      if (name !== 'sessionController') return undefined
+      return {
+        page: async (request: Record<string, unknown>, signal?: AbortSignal) => {
+          // Mirrors the host: a missing signal dies on `throwIfAborted()`.
+          if (signal === undefined || typeof signal.throwIfAborted !== 'function') {
+            throw new TypeError("Cannot read properties of undefined (reading 'throwIfAborted')")
+          }
+          calls.push({ request, signal })
+          return {
+            records: [
+              {
+                event: {
+                  type: 'user/message',
+                  seq: 0,
+                  data: { source: { kind: 'user' }, message: { content: [{ type: 'text', text: 'привет' }] } },
+                },
+              },
+              {
+                event: {
+                  type: 'assistant/message',
+                  seq: 1,
+                  data: { message: { content: [{ type: 'text', text: 'здравствуйте' }] } },
+                },
+              },
+            ],
+            hasMore: false,
+          }
+        },
+      }
+    },
+    on() { return () => {} },
+  }
+  const bridge = new TelegramBridge(ctx as any, {
+    token: 't',
+    allowedUserIds: [1],
+    allowAllUsers: false,
+    client: fakeClient(sent),
+    sleep: async () => {},
+  })
+  bindDirectly(bridge, 10, 'h1')
+  await bridge.processUpdate(messageUpdate(10, 1, '/history'))
+  assert.equal(sent.length, 1, JSON.stringify(sent.map((m) => m.text)))
+  assert.match(sent[0]!.text, /привет/)
+  assert.match(sent[0]!.text, /здравствуйте/)
+  assert.doesNotMatch(sent[0]!.text, /История недоступна/)
+  assert.equal(calls.length, 1)
+  assert.equal((calls[0]!.signal as AbortSignal).aborted, false)
+  const request = calls[0]!.request as { address?: { kind?: string; sessionId?: string }; throughSeq?: number }
+  assert.deepEqual(request.address, { kind: 'session', sessionId: 'h1' })
+  assert.equal(request.throughSeq, -1)
+  await bridge.stop()
+})
+
+test('/history reports the friendly message when the host has no page()', async () => {
+  const sent: SentMessage[] = []
+  const ctx = {
+    logger: { info() {}, warn() {}, error() {} },
+    agents: { list: () => [], roots: () => [], get: () => undefined },
+    // A host service that answers, but does not expose history pagination.
+    get(name: string) {
+      return name === 'sessionController' ? {} : undefined
+    },
+    on() { return () => {} },
+  }
+  const bridge = new TelegramBridge(ctx as any, {
+    token: 't',
+    allowedUserIds: [1],
+    allowAllUsers: false,
+    client: fakeClient(sent),
+    sleep: async () => {},
+  })
+  bindDirectly(bridge, 10, 'h1')
+  await bridge.processUpdate(messageUpdate(10, 1, '/history'))
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0]!.text, 'История недоступна: хост не отдал страницу сессии.')
+  await bridge.stop()
+})

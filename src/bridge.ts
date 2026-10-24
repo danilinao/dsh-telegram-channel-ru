@@ -13,6 +13,7 @@ import type { TelegramUserEntry } from './config.js'
 import { resolveApiProxy } from './apiproxy.js'
 import {
   catalogFromLiveAgents,
+  debugLog,
   hostService,
   isArchived,
   resolveSessionTitle,
@@ -242,6 +243,14 @@ function translateCompactResult(result: { kind: string; text?: string } | undefi
   }
   return undefined
 }
+
+/**
+ * Deadline for one host `sessionController` call that requires an AbortSignal.
+ * The host starts such methods with `signal.throwIfAborted()`, so a signal is
+ * mandatory; the bound only stops a wedged persistence read from hanging the
+ * call forever.
+ */
+const HOST_CALL_TIMEOUT_MS = 20_000
 
 const WS_CB = 'ws:'
 const SID_CB = 'sid:'
@@ -1952,7 +1961,7 @@ export class TelegramBridge {
         sessionId: string
         mode: 'queue' | 'steer'
         content: WireContentPart[]
-      }) => Promise<{ accepted?: boolean }>
+      }, signal?: AbortSignal) => Promise<{ accepted?: boolean }>
     }>(this.ctx, 'sessionController')
     const hostPrompt = controller?.prompt
     if (!proxy?.sessions?.prompt && typeof hostPrompt !== 'function') {
@@ -1970,7 +1979,7 @@ export class TelegramBridge {
           sessionId: binding.sessionId,
           mode: 'queue',
           content: parts,
-        })
+        }, AbortSignal.timeout(HOST_CALL_TIMEOUT_MS))
         if (!accepted?.accepted) throw new Error('хост не подтвердил приём')
       } catch (err) {
         await this.enqueueNotice(chatId, MSG.IMAGE_FAILED(this.redact(err)))
@@ -3381,20 +3390,28 @@ export class TelegramBridge {
           maxMessages?: number
           beforeSeq?: number
         },
+        signal?: AbortSignal,
       ) => Promise<{
         records?: Array<{ event?: { type?: string; seq?: number; data?: Record<string, unknown> } }>
         hasMore?: boolean
       }>
     }>(this.ctx, 'sessionController')
     const page = controller?.page
-    if (typeof page !== 'function') return undefined
+    if (typeof page !== 'function') {
+      debugLog('fetchHistoryPage: sessionController.page is not a function')
+      return undefined
+    }
     try {
+      // The host's `page(request, signal)` starts with `signal.throwIfAborted()`,
+      // so omitting the signal throws a TypeError before any read happens. That
+      // was the 0.12.0 "/history" failure ("хост не отдал страницу сессии").
+      // The bound keeps a hung persistence read from pinning the poller forever.
       const res = await page.call(controller, {
         address: { kind: 'session', sessionId },
         throughSeq: -1,
         maxMessages,
         ...(beforeSeq !== undefined ? { beforeSeq } : {}),
-      })
+      }, AbortSignal.timeout(HOST_CALL_TIMEOUT_MS))
       const records = res?.records ?? []
       const blocks: string[] = []
       let earliest: number | undefined
@@ -3423,6 +3440,9 @@ export class TelegramBridge {
       return { blocks, earliestSeq: earliest, hasMore: Boolean(res?.hasMore) }
     } catch (err) {
       this.ctx.logger.warn(`dsh-telegram-channel: history page failed: ${this.redact(err)}`)
+      // `ctx.logger` output is not visible in the service journal on this host,
+      // so mirror the reason into the plugin debug log where it can be read.
+      debugLog(`fetchHistoryPage failed: ${String(err)}`)
       return undefined
     }
   }
