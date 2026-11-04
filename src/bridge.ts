@@ -38,7 +38,7 @@ import { MSG, LAST_CB, ASK_CB, APPROVAL_CB, RETRY_CB, CONTINUE_CB, NTF_HIST_CB, 
 import { escapeHtml, markdownToHtml, splitMessage } from './format.js'
 import { splitRichMarkdown } from './rich-format.js'
 import { formatLastTurn, loadLastTurn } from './history.js'
-import { describeAgent, displayLabel, workspaceName } from './label.js'
+import { describeAgent, displayLabel, isSubagentSession, workspaceName } from './label.js'
 import {
   formatModel,
   loadSessionModels,
@@ -278,6 +278,24 @@ const ARCLIST_CB = 'arcl:'
 const BACK_SESS_CB = 'bs'
 const MAX_BUTTONS = 40
 
+/**
+ * Tools whose only job is to run / steer / list subagents. Their calls are the
+ * parent's private bookkeeping about child agents: the phone asked for the
+ * conversation, not for "subagent started / finished / message delivered"
+ * reports, so these calls are never mirrored into Telegram. Everything else
+ * (including `job_*` background jobs and `workflow`) keeps its spoiler.
+ */
+const SUBAGENT_TOOLS: ReadonlySet<string> = new Set([
+  'subagent',
+  'subagent_fork',
+  'send_message',
+  'list_agents',
+  'interrupt_agent',
+])
+
+/** Cap for the learned subagent-session ids; a session list, not a log. */
+const SUBAGENT_CACHE_LIMIT = 500
+
 function lastContextKeyboard(): InlineKeyboardMarkup {
   return {
     inline_keyboard: [[{ text: 'Последний диалог', callback_data: LAST_CB }]],
@@ -366,6 +384,12 @@ export class TelegramBridge {
   private readonly chatLookupFailed = new Map<number, number>()
   /** Последний загруженный каталог — источник имён сессий для уведомлений. */
   private lastCatalog?: CatalogSnapshot
+  /**
+   * Session ids the bridge has learned are a subagent's own log. `session.header.origin`
+   * answers this synchronously for a live session; the catalog's `origin` is the
+   * fallback for an id seen only on disk. Remembered so one look suffices.
+   */
+  private readonly subagentSessions = new Set<string>()
   /** sessionId → накопленные рассуждения текущего шага (уходят спойлером). */
   private readonly reasoningBuffers = new Map<string, string>()
   /** chatId → курсор для листания истории (beforeSeq) и признак «есть ещё». */
@@ -1192,18 +1216,44 @@ export class TelegramBridge {
   }
 
   /**
+   * Is this the log of a subagent's own run? Such a session is real and durable
+   * but it is *not* a conversation: nothing is ever bound to it, nobody asks it
+   * questions from Telegram, and its lifecycle ("started / running / finished")
+   * is exactly the noise the owner does not want on the phone — the parent's
+   * turn already reports the outcome. The header is authoritative for a live
+   * session; the catalog row (filled from `sessionController.list()`, where the
+   * picker already hides these) covers an id seen only on disk.
+   */
+  private isSubagentSessionId(sessionId: string, session?: unknown): boolean {
+    if (this.subagentSessions.has(sessionId)) return true
+    const origin = isSubagentSession(session)
+      || this.lastCatalog?.sessionsById.get(sessionId)?.origin === 'subagent'
+    if (!origin) return false
+    if (this.subagentSessions.size >= SUBAGENT_CACHE_LIMIT) {
+      const first = this.subagentSessions.keys().next().value
+      if (first !== undefined) this.subagentSessions.delete(first)
+    }
+    this.subagentSessions.add(sessionId)
+    return true
+  }
+
+  /**
    * Chats that must hear about lifecycle events of this session: those bound
    * to it, plus every chat following "every session" (the default), so a task
-   * started on the desktop still pings the phone.
+   * started on the desktop still pings the phone. "Every session" means every
+   * *conversation*: a subagent's session only ever reaches a chat that is
+   * explicitly bound to it (which the bot never creates), so subagents stay
+   * invisible on the phone.
    */
   private lifecycleTargets(sessionId: string): number[] {
     const chats = new Set<number>()
     for (const b of this.bindings.values()) {
       if (b.sessionId === sessionId) chats.add(b.chatId)
     }
+    const broadcast = !this.isSubagentSessionId(sessionId)
     for (const chatId of this.knownChats) {
       if (this.notifyPrefs.get(String(chatId)) === 'off') continue
-      if (this.notifyScopeFor(chatId) === 'every') chats.add(chatId)
+      if (broadcast && this.notifyScopeFor(chatId) === 'every') chats.add(chatId)
     }
     return [...chats]
   }
@@ -2098,6 +2148,11 @@ export class TelegramBridge {
 
   private async onSessionEvent(session: SessionLike, event: SessionEvent): Promise<void> {
     const id = String(session.id)
+    // A subagent's session is the parent's private machinery: its turns, tool
+    // calls and lifecycle are never mirrored into any chat. Nothing is bound to
+    // it either, so this is also what keeps `lifecycleTargets` from broadcasting
+    // "subagent finished" to every chat that follows all sessions.
+    if (this.isSubagentSessionId(id, session)) return
     const targets = [...this.bindings.values()].filter((b) => b.sessionId === id)
     const lifecycle = this.lifecycleTargets(id)
     // Content (assistant text, tool progress) stays bound-only; lifecycle goes wider.
@@ -2160,6 +2215,11 @@ export class TelegramBridge {
         }
         this.callNames.set(String(event.data.callId), String(name))
       }
+      // Subagent bookkeeping (spawn / steer / list / stop) stays off the phone:
+      // the owner asked not to be told about subagent status, and the spoiler
+      // would dump the whole subagent prompt into the chat. Recorded above so a
+      // later error notice can still name the tool, then dropped here.
+      if (SUBAGENT_TOOLS.has(String(name))) return
       const rawArgs = typeof event.data?.arguments === 'string'
         ? event.data.arguments
         : JSON.stringify(event.data?.arguments ?? {}, null, 2)
@@ -2222,6 +2282,9 @@ export class TelegramBridge {
       if (data?.error) {
         const callKey = String(data.message?.tool_use_id ?? data.message?.callId ?? '')
         const name = this.callNames.get(callKey) ?? 'tool'
+        // Same rule as the call itself: a subagent failing to start or take a
+        // message is internal bookkeeping, not something the phone reports.
+        if (SUBAGENT_TOOLS.has(name)) return
         for (const b of targets)
           this.enqueueNotice(b.chatId, `> Инструмент ${name} — ошибка: ${String(data.error.name ?? 'Error')}${data.error.code ? `/${String(data.error.code)}` : ''}`)
       }
@@ -2417,6 +2480,10 @@ export class TelegramBridge {
     next: () => Promise<unknown>,
   ): Promise<unknown> {
     const sessionId = request?.agent?.id !== undefined ? String(request.agent.id) : undefined
+    // A subagent asking a question is not the owner's business on the phone: the
+    // parent decides. Learn the origin from the live header here, before the
+    // catalog (the only other source) has had a chance to list the child.
+    if (sessionId !== undefined && this.isSubagentSessionId(sessionId, request?.agent?.session)) return next()
     // Phone side is offered the question when the chat is bound to that session
     // OR follows every session (desktop-started tasks included).
     const wantedChat = sessionId !== undefined && this.lifecycleTargets(sessionId).length > 0

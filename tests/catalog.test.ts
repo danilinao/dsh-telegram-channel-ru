@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  catalogFromLiveAgents,
   visibleSessionsForWorkspace,
   workspacesWithVisibleSessions,
   type CatalogSnapshot,
@@ -26,4 +27,21 @@ test('visible sessions exclude archived blank and subagent', () => {
   const rows = visibleSessionsForWorkspace(catalog, catalog.workspaces[0]!)
   assert.deepEqual(rows.map((r) => r.sessionId), ['ok'])
   assert.equal(workspacesWithVisibleSessions(catalog).length, 1)
+})
+
+test('the live-agent fallback never lists a subagent child as a session', () => {
+  const followups: never[] = []
+  const make = (id: string, origin?: 'subagent') => ({
+    id,
+    session: { header: { cwd: '/proj/x', ...(origin ? { origin } : {}) } },
+    followup: (m: never) => { followups.push(m) },
+  })
+  const catalog = catalogFromLiveAgents([
+    make('main-1') as never,
+    make('child-1', 'subagent') as never,
+    make('main-2') as never,
+  ])
+  assert.deepEqual([...catalog.sessionsById.keys()], ['main-1', 'main-2'])
+  assert.deepEqual(catalog.workspaces[0]!.sessionIds, ['main-1', 'main-2'])
+  assert.equal(catalog.complete, false)
 })

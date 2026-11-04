@@ -5,7 +5,9 @@ import {
   describeAgent,
   detailLines,
   displayLabel,
+  isSubagentSession,
   readSessionCwd,
+  readSessionOrigin,
   readSessionTitle,
   workspaceName,
 } from '../src/label.ts'
@@ -63,4 +65,14 @@ test('buttonLabel stays within 64 chars', () => {
     sessionId: 'x',
   })
   assert.ok([...label].length <= 64)
+})
+
+test('readSessionOrigin reads the durable header, isSubagentSession narrows it', () => {
+  assert.equal(readSessionOrigin({ header: { origin: 'subagent' } }), 'subagent')
+  assert.equal(readSessionOrigin({ header: { cwd: '/p' } }), undefined)
+  assert.equal(readSessionOrigin({ meta: { cwd: '/p' } }), undefined)
+  assert.equal(readSessionOrigin(undefined), undefined)
+  assert.equal(isSubagentSession({ header: { origin: 'subagent' } }), true)
+  assert.equal(isSubagentSession({ header: { cwd: '/p' } }), false)
+  assert.equal(isSubagentSession({}), false)
 })

@@ -3,7 +3,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 
 /** Loose session shape so tests and live Session both work. */
 export interface SessionView {
-  header?: { cwd?: string }
+  header?: { cwd?: string; origin?: string }
   meta?: { cwd?: string }
   events?: ReadonlyArray<{ type?: string; data?: { title?: string } }>
 }
@@ -25,6 +25,22 @@ export function readSessionCwd(session: unknown): string | undefined {
   if (typeof cwd !== 'string') return undefined
   const trimmed = cwd.trim()
   return trimmed.length > 0 ? trimmed : undefined
+}
+
+/**
+ * Durable session origin from the session header. The host writes
+ * `origin: 'subagent'` for the child sessions it runs on behalf of a subagent
+ * (and `delegationDepth` beside it), which is the one reliable way to tell a
+ * child agent apart from a conversation — both are ordinary sessions otherwise.
+ */
+export function readSessionOrigin(session: unknown): string | undefined {
+  const origin = (session as SessionView | undefined)?.header?.origin
+  return typeof origin === 'string' && origin.length > 0 ? origin : undefined
+}
+
+/** True when this session is a subagent's own work log, not a user conversation. */
+export function isSubagentSession(session: unknown): boolean {
+  return readSessionOrigin(session) === 'subagent'
 }
 
 export function workspaceName(cwd: string | undefined): string | undefined {

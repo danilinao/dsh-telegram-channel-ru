@@ -83,6 +83,8 @@ function startTestBridge(bridge: TelegramBridge): void {
 function makeAgent(id: string, followups: UserMessage[], opts?: {
   cwd?: string
   title?: string
+  /** `subagent` marks the session as a child agent's own log (host header). */
+  origin?: 'subagent'
 }) {
   const cwd = opts?.cwd ?? `/proj/${id}`
   const events = opts?.title
@@ -91,7 +93,7 @@ function makeAgent(id: string, followups: UserMessage[], opts?: {
   return {
     id: SessionId(id),
     session: {
-      header: { cwd },
+      header: { cwd, ...(opts?.origin === undefined ? {} : { origin: opts.origin }) },
       meta: { cwd },
       events,
     },
@@ -2220,5 +2222,225 @@ test('/history takes the cursor from sessionQuery.observeSession, not follow()',
   const pageCall = calls.find((c) => c.kind === 'page')
   assert.equal(pageCall!.request!.throughSeq, 1)
   assert.equal(disposed, 1, 'the observation must be disposed')
+  await bridge.stop()
+})
+
+// ── Subagents stay invisible on the phone ──────────────────────────────────
+//
+// The owner asked the bot not to report subagent status: a child agent's own
+// session (host header `origin: 'subagent'`) is bookkeeping, not a conversation.
+// Its lifecycle pings, ask_user prompts and spawn/steer tool calls must not reach
+// any chat — while a normal session keeps behaving exactly as before.
+
+test('a subagent session never notifies chats that follow every session', async () => {
+  const sent: SentMessage[] = []
+  const followups: UserMessage[] = []
+  const main = makeAgent('main-agent-free-notify', followups)
+  let listener: ((session: { id: ReturnType<typeof SessionId> }, event: unknown) => void) | undefined
+  const ctx = {
+    logger: { info() {}, warn() {}, error() {} },
+    agents: {
+      list: () => [main],
+      roots: () => [main],
+      get: (id: ReturnType<typeof SessionId>) => (String(id) === 'main-agent-free-notify' ? main : undefined),
+    },
+    on(event: string, handler: typeof listener) {
+      if (event === 'session/event') listener = handler
+      return () => {}
+    },
+  }
+  const bridge = new TelegramBridge(ctx as any, {
+    token: 't',
+    allowedUserIds: [1],
+    allowAllUsers: false,
+    client: fakeClient(sent),
+    sleep: async () => {},
+  })
+  startTestBridge(bridge)
+  // Any authorized message remembers the chat; default scope is "every session".
+  await bridge.processUpdate(messageUpdate(10, 1, '/help', 3))
+  sent.length = 0
+
+  const childSession = { id: SessionId('child-agent-1'), header: { origin: 'subagent' } }
+  listener!(childSession, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+  listener!(childSession, { type: 'turn/start', data: {} })
+  await new Promise<void>((resolve) => setTimeout(resolve, 20))
+  assert.deepEqual(sent, [], 'a finished subagent must not announce itself on the phone')
+
+  // Control: the very same event shape for a real session still gets through.
+  listener!({ id: SessionId('main-agent-free-notify'), header: { cwd: '/proj/x' } }, {
+    type: 'turn/end',
+    data: { reason: { kind: 'completed' } },
+  })
+  await new Promise<void>((resolve) => setTimeout(resolve, 20))
+  assert.ok(
+    sent.some((message) => message.text.includes('Сессия завершила работу')),
+    'a normal session still reports completion',
+  )
+  await bridge.stop()
+})
+
+test('a subagent turn end is not announced even when the catalog has not listed it yet', async () => {
+  const sent: SentMessage[] = []
+  const followups: UserMessage[] = []
+  const main = makeAgent('main-agent-catalog-lag', followups)
+  let listener: ((session: { id: ReturnType<typeof SessionId> }, event: unknown) => void) | undefined
+  const ctx = {
+    logger: { info() {}, warn() {}, error() {} },
+    agents: { list: () => [main], roots: () => [main], get: () => undefined },
+    on(event: string, handler: typeof listener) {
+      if (event === 'session/event') listener = handler
+      return () => {}
+    },
+  }
+  const bridge = new TelegramBridge(ctx as any, {
+    token: 't',
+    allowedUserIds: [1],
+    allowAllUsers: false,
+    client: fakeClient(sent),
+    sleep: async () => {},
+  })
+  startTestBridge(bridge)
+  await bridge.processUpdate(messageUpdate(10, 1, '/help', 3))
+  sent.length = 0
+  // Only the live header says "subagent"; the catalog fallback has no row at all.
+  listener!({ id: SessionId('child-agent-2'), header: { origin: 'subagent' } }, {
+    type: 'turn/end',
+    data: { reason: { kind: 'error', error: { message: 'child blew up' } } },
+  })
+  await new Promise<void>((resolve) => setTimeout(resolve, 20))
+  assert.deepEqual(sent, [], 'the header alone is enough to stay silent')
+  await bridge.stop()
+})
+
+test('subagent spawn / steer tool calls are not mirrored, other tools are', async () => {
+  const sent: SentMessage[] = []
+  const followups: UserMessage[] = []
+  const sessionId = 'live-subagent-tools'
+  const agent = makeAgent(sessionId, followups)
+  let listener: ((session: { id: ReturnType<typeof SessionId> }, event: unknown) => void) | undefined
+  const ctx = {
+    logger: { info() {}, warn() {}, error() {} },
+    agents: {
+      list: () => [agent],
+      roots: () => [agent],
+      get: (id: ReturnType<typeof SessionId>) => (String(id) === sessionId ? agent : undefined),
+    },
+    on(event: string, handler: typeof listener) {
+      if (event === 'session/event') listener = handler
+      return () => {}
+    },
+  }
+  const bridge = new TelegramBridge(ctx as any, {
+    token: 't',
+    allowedUserIds: [1],
+    allowAllUsers: false,
+    client: fakeClient(sent),
+    sleep: async () => {},
+  })
+  startTestBridge(bridge)
+  await bridge.processUpdate(bindUpdate(10, 1, sessionId))
+  sent.length = 0
+  const live = { id: SessionId(sessionId), header: { cwd: `/proj/${sessionId}` } }
+
+  for (const name of ['subagent', 'subagent_fork', 'list_agents', 'send_message', 'interrupt_agent']) {
+    listener!(live, { type: 'tool/call', data: { name, callId: `c-${name}`, arguments: { prompt: 'secret prompt' } } })
+  }
+  await new Promise<void>((resolve) => setTimeout(resolve, 20))
+  assert.deepEqual(sent, [], 'no spoiler for subagent bookkeeping')
+
+  listener!(live, { type: 'tool/call', data: { name: 'bash', callId: 'c-bash', arguments: { command: 'ls' } } })
+  await new Promise<void>((resolve) => setTimeout(resolve, 20))
+  assert.equal(sent.length, 1, 'ordinary tools keep their spoiler')
+  assert.match(sent[0].text, /bash/)
+  assert.ok(!sent.some((message) => message.text.includes('secret prompt')), 'the child prompt never leaks')
+  await bridge.stop()
+})
+
+test('a subagent error result is not reported as a tool failure', async () => {
+  const sent: SentMessage[] = []
+  const followups: UserMessage[] = []
+  const sessionId = 'live-subagent-tool-error'
+  const agent = makeAgent(sessionId, followups)
+  let listener: ((session: { id: ReturnType<typeof SessionId> }, event: unknown) => void) | undefined
+  const ctx = {
+    logger: { info() {}, warn() {}, error() {} },
+    agents: {
+      list: () => [agent],
+      roots: () => [agent],
+      get: (id: ReturnType<typeof SessionId>) => (String(id) === sessionId ? agent : undefined),
+    },
+    on(event: string, handler: typeof listener) {
+      if (event === 'session/event') listener = handler
+      return () => {}
+    },
+  }
+  const bridge = new TelegramBridge(ctx as any, {
+    token: 't',
+    allowedUserIds: [1],
+    allowAllUsers: false,
+    client: fakeClient(sent),
+    sleep: async () => {},
+  })
+  startTestBridge(bridge)
+  await bridge.processUpdate(bindUpdate(10, 1, sessionId))
+  sent.length = 0
+  const live = { id: SessionId(sessionId), header: { cwd: `/proj/${sessionId}` } }
+
+  listener!(live, { type: 'tool/call', data: { name: 'subagent', callId: 'c1', arguments: {} } })
+  listener!(live, { type: 'tool/result', data: { error: { name: 'SpawnError' }, message: { tool_use_id: 'c1' } } })
+  await new Promise<void>((resolve) => setTimeout(resolve, 20))
+  assert.deepEqual(sent, [], 'a failed subagent spawn is internal')
+
+  listener!(live, { type: 'tool/call', data: { name: 'bash', callId: 'c2', arguments: {} } })
+  listener!(live, { type: 'tool/result', data: { error: { name: 'ExitError' }, message: { tool_use_id: 'c2' } } })
+  await new Promise<void>((resolve) => setTimeout(resolve, 20))
+  assert.ok(sent.some((message) => message.text.includes('bash')), 'ordinary tool failures still show')
+  await bridge.stop()
+})
+
+test('a subagent question is never offered to Telegram', async () => {
+  const sent: SentMessage[] = []
+  const followups: UserMessage[] = []
+  const main = makeAgent('main-agent-ask', followups)
+  const child = makeAgent('child-agent-ask', followups, { origin: 'subagent' })
+  let questionHook: ((request: unknown, next: () => Promise<unknown>) => Promise<unknown>) | undefined
+  const ctx = {
+    logger: { info() {}, warn() {}, error() {} },
+    agents: {
+      list: () => [main, child],
+      roots: () => [main],
+      get: (id: ReturnType<typeof SessionId>) => (String(id) === 'child-agent-ask' ? child : undefined),
+    },
+    on(event: string, listener: (...args: any[]) => unknown) {
+      if (event === 'user-questions/request') {
+        questionHook = listener as typeof questionHook
+        return () => {}
+      }
+      return () => {}
+    },
+  }
+  const bridge = new TelegramBridge(ctx as any, {
+    token: 't',
+    allowedUserIds: [1],
+    allowAllUsers: false,
+    client: fakeClient(sent),
+    sleep: async () => {},
+  })
+  startTestBridge(bridge)
+  await bridge.processUpdate(messageUpdate(10, 1, '/help', 3))
+  sent.length = 0
+
+  let nextCalled = 0
+  const answer = await questionHook!({
+    agent: child,
+    questions: [{ id: 'q', question: 'Что делать дальше?', options: [{ label: 'Да' }] }],
+  }, () => {
+    nextCalled += 1
+    return Promise.resolve('gui-answer')
+  })
+  assert.equal(nextCalled, 1, 'the host keeps answering')
+  assert.equal(answer, 'gui-answer')
+  assert.deepEqual(sent, [], 'the phone is never asked on a subagent\'s behalf')
   await bridge.stop()
 })

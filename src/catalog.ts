@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { resolveApiProxy } from './apiproxy.js'
-import { describeAgent, workspaceName } from './label.js'
+import { describeAgent, isSubagentSession, workspaceName } from './label.js'
 
 export interface WorkspaceRow {
   id: string
@@ -695,6 +695,9 @@ export function catalogFromLiveAgents(agents: Agent[], ctx?: Context): CatalogSn
   const byPath = new Map<string, { title: string; path: string; sessionIds: string[] }>()
 
   agents.forEach((agent, index) => {
+    // `ctx.agents.list()` also hands back the child agents a subagent owns; those
+    // are not conversations and must not appear as pickable sessions.
+    if (isSubagentSession(agent.session)) return
     const parts = describeAgent(agent, index, ctx)
     const sessionId = parts.sessionId
     const cwd = parts.cwd ?? '(неизвестно)'

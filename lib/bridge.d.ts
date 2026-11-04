@@ -77,6 +77,12 @@ export declare class TelegramBridge {
     private readonly chatLookupFailed;
     /** Последний загруженный каталог — источник имён сессий для уведомлений. */
     private lastCatalog?;
+    /**
+     * Session ids the bridge has learned are a subagent's own log. `session.header.origin`
+     * answers this synchronously for a live session; the catalog's `origin` is the
+     * fallback for an id seen only on disk. Remembered so one look suffices.
+     */
+    private readonly subagentSessions;
     /** sessionId → накопленные рассуждения текущего шага (уходят спойлером). */
     private readonly reasoningBuffers;
     /** chatId → курсор для листания истории (beforeSeq) и признак «есть ещё». */
@@ -192,9 +198,22 @@ export declare class TelegramBridge {
     /** Warm the catalog so notifications can name sessions and projects. */
     private prefetchCatalog;
     /**
+     * Is this the log of a subagent's own run? Such a session is real and durable
+     * but it is *not* a conversation: nothing is ever bound to it, nobody asks it
+     * questions from Telegram, and its lifecycle ("started / running / finished")
+     * is exactly the noise the owner does not want on the phone — the parent's
+     * turn already reports the outcome. The header is authoritative for a live
+     * session; the catalog row (filled from `sessionController.list()`, where the
+     * picker already hides these) covers an id seen only on disk.
+     */
+    private isSubagentSessionId;
+    /**
      * Chats that must hear about lifecycle events of this session: those bound
      * to it, plus every chat following "every session" (the default), so a task
-     * started on the desktop still pings the phone.
+     * started on the desktop still pings the phone. "Every session" means every
+     * *conversation*: a subagent's session only ever reaches a chat that is
+     * explicitly bound to it (which the bot never creates), so subagents stay
+     * invisible on the phone.
      */
     private lifecycleTargets;
     private sendWorkspacePicker;
