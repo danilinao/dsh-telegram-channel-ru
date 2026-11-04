@@ -4,10 +4,15 @@
 #   ./PUBLISH.sh                 # push master + теги в origin
 #   ./PUBLISH.sh --dry-run       # только показать, что уйдёт
 #
-# Токен берётся из стора DSH (~/.dsh/.credentials.yaml, ключ GITHUB_TOKEN) и
-# передаётся git через GIT_ASKPASS, поэтому в .git/config, в истории shell и в
-# командной строке он не остаётся. Нужен токен с правом записи в репозиторий
-# (fine-grained: Contents: read/write; классический: scope repo).
+# Токен берётся из стора DSH (~/.dsh/.credentials.yaml). Основной ключ —
+# GITHUB_TOKEN_DANILINAO: у него есть Contents: write на репозитории этого
+# проекта (проверено 2026-11-05). Фолбэк — GITHUB_TOKEN для совместимости:
+# тот токен fine-grained с write только на репозиториях KalichDevelop, а на
+# danilinao/* у него read, поэтому push им отвечает 403 «Resource not
+# accessible by personal access token». Токен уходит в git через GIT_ASKPASS,
+# поэтому в .git/config, в истории shell и в командной строке он не остаётся.
+# Нужен токен с правом записи в репозиторий (fine-grained: Contents: read/write;
+# классический: scope repo).
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,11 +36,11 @@ TOKEN="$(python3 - <<'PY'
 import yaml, pathlib
 p = pathlib.Path.home() / '.dsh' / '.credentials.yaml'
 refs = (yaml.safe_load(p.read_text()) or {}).get('refs') or {}
-print(refs.get('GITHUB_TOKEN') or '')
+print(refs.get('GITHUB_TOKEN_DANILINAO') or refs.get('GITHUB_TOKEN') or '')
 PY
 )"
 if [ -z "$TOKEN" ]; then
-  echo "нет GITHUB_TOKEN в ~/.dsh/.credentials.yaml" >&2
+  echo "нет GITHUB_TOKEN_DANILINAO (или GITHUB_TOKEN) в ~/.dsh/.credentials.yaml" >&2
   exit 1
 fi
 
